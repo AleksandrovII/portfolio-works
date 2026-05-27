@@ -13,7 +13,6 @@ import functools
 from t_tech.invest import OperationState
 from time import sleep
 
-TOKEN = "t.cY2p_sUdaAU8VFOFaLKw0Gv7hbdISWAit6rbeSsZWQcgjg0eY_ZGKI5mbVu7BJdtQ-QRfhxcgqAhWLJnh2y-bA"
 
 def get_currency_rate(client, figi):
     try:
