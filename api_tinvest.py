@@ -11,9 +11,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# TOKEN = os.getenv("INVEST_TOKEN")
-
-TOKEN = "t.cY2p_sUdaAU8VFOFaLKw0Gv7hbdISWAit6rbeSsZWQcgjg0eY_ZGKI5mbVu7BJdtQ-QRfhxcgqAhWLJnh2y-bA"
+TOKEN = os.getenv("INVEST_TOKEN")
 
 if not TOKEN:
     raise ValueError("Не задана переменная окружения INVEST_TOKEN. Установите ее командой: export INVEST_TOKEN='ваш_токен'")
