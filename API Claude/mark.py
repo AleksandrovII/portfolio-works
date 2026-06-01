@@ -1,0 +1,479 @@
+"""
+mark.py
+-------
+Markowitz portfolio optimizer and risk estimator.
+
+Connects to T-Invest via portfolio_works_library, downloads historical
+daily prices, computes correlation/covariance, finds the optimal
+(max-Sharpe) and minimum-variance portfolios, then compares them to
+your actual weights to estimate whether you are taking enough risk.
+
+Usage:
+    export INVEST_TOKEN='your_token'
+    cd "API Claude"
+    /opt/miniconda3/bin/python mark.py              # 365-day window
+    /opt/miniconda3/bin/python mark.py 730          # 2-year window
+    /opt/miniconda3/bin/python mark.py 365 --top 15 # top-15 by value
+    /opt/miniconda3/bin/python mark.py 365 --spearman
+"""
+
+import sys
+import logging
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.stats import pearsonr, spearmanr
+
+from t_tech.invest import Client
+
+from portfolio_works_library import (
+    TOKEN,
+    CorrMethod,
+    fetch_all_positions,
+    fetch_price_history,
+    build_figi_map,
+    build_returns_matrix,
+    portfolio_weights,
+    get_rates,
+)
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# OFZ 10-year yield used as risk-free rate for Sharpe calculation
+RISK_FREE_RATE = 0.16
+
+# ── Dark theme ─────────────────────────────────────────────────────────────────
+
+_DARK_BG  = "#0D1117"
+_PANEL_BG = "#161B22"
+_ACCENT1  = "#58A6FF"
+_ACCENT2  = "#3FB950"
+_TEXT     = "#E6EDF3"
+_DIM      = "#8B949E"
+_GRID     = "#21262D"
+_WARN     = "#F78166"
+_GOLD     = "#FFD700"
+
+
+def _dark_theme() -> None:
+    plt.rcParams.update({
+        "figure.facecolor": _DARK_BG, "axes.facecolor":  _PANEL_BG,
+        "axes.edgecolor":   _GRID,    "axes.labelcolor":  _DIM,
+        "axes.titlecolor":  _TEXT,    "xtick.color":      _DIM,
+        "ytick.color":      _DIM,     "grid.color":       _GRID,
+        "grid.linewidth":   0.5,      "text.color":       _TEXT,
+        "legend.facecolor": _PANEL_BG,"legend.edgecolor": _GRID,
+        "legend.labelcolor":_TEXT,    "font.family":      "DejaVu Sans",
+    })
+
+
+# ── Correlation ────────────────────────────────────────────────────────────────
+
+def compute_correlation(
+    returns: pd.DataFrame,
+    method: CorrMethod = "pearson",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (correlation matrix, p-value matrix)."""
+    corr = returns.corr(method=method)
+    n    = len(corr)
+    pval = pd.DataFrame(np.ones((n, n)), index=corr.index, columns=corr.columns)
+    for i in corr.index:
+        for j in corr.columns:
+            if i == j:
+                pval.loc[i, j] = 0.0
+                continue
+            a, b = returns[i].dropna(), returns[j].dropna()
+            common = a.index.intersection(b.index)
+            a, b   = a[common], b[common]
+            if len(a) < 3:
+                continue
+            _, p = spearmanr(a, b) if method == "spearman" else pearsonr(a, b)
+            pval.loc[i, j] = float(p)
+    return corr, pval
+
+
+# ── Markowitz optimization ─────────────────────────────────────────────────────
+
+def _portfolio_stats(
+    weights: np.ndarray,
+    mean_ret: pd.Series,
+    cov: pd.DataFrame,
+) -> Tuple[float, float, float]:
+    """Return (annualised return, annualised volatility, Sharpe ratio)."""
+    r = float(np.dot(weights, mean_ret))
+    v = float(np.sqrt(weights @ cov.values @ weights))
+    s = (r - RISK_FREE_RATE) / v if v > 0 else 0.0
+    return r, v, s
+
+
+def optimize_portfolio(returns: pd.DataFrame) -> Dict:
+    """
+    Find three reference portfolios via SLSQP:
+      max_sharpe  — maximises (return - Rf) / volatility
+      min_vol     — minimises portfolio volatility
+      equal       — naive 1/N baseline
+
+    Returns a dict with tickers, annualised mean_ret/cov, weight Series,
+    and a stats_df summary table.
+    """
+    mean_ret = returns.mean() * 252
+    cov      = returns.cov() * 252
+    n        = len(mean_ret)
+    tickers  = list(mean_ret.index)
+    bounds      = [(0.0, 1.0)] * n
+    constraints = {"type": "eq", "fun": lambda w: w.sum() - 1}
+    init        = np.ones(n) / n
+
+    res_sharpe = minimize(
+        lambda w: -_portfolio_stats(w, mean_ret, cov)[2],
+        init, method="SLSQP", bounds=bounds, constraints=constraints,
+    )
+    res_vol = minimize(
+        lambda w: _portfolio_stats(w, mean_ret, cov)[1],
+        init, method="SLSQP", bounds=bounds, constraints=constraints,
+    )
+
+    def _row(label, w):
+        r, v, s = _portfolio_stats(w, mean_ret, cov)
+        return {"Portfolio": label, "Return (%)": round(r * 100, 2),
+                "Volatility (%)": round(v * 100, 2), "Sharpe": round(s, 3)}
+
+    w_sharpe = res_sharpe.x
+    w_vol    = res_vol.x
+    w_equal  = np.ones(n) / n
+
+    return {
+        "tickers":   tickers,
+        "mean_ret":  mean_ret,
+        "cov":       cov,
+        "max_sharpe":pd.Series(w_sharpe, index=tickers),
+        "min_vol":   pd.Series(w_vol,    index=tickers),
+        "equal":     pd.Series(w_equal,  index=tickers),
+        "stats_df":  pd.DataFrame([
+            _row("Max Sharpe",   w_sharpe),
+            _row("Min Vol",      w_vol),
+            _row("Equal Weight", w_equal),
+        ]),
+    }
+
+
+# ── Risk estimation ────────────────────────────────────────────────────────────
+
+def estimate_risk(
+    actual_weights: pd.Series,
+    opt: Dict,
+    avg_pairwise_corr: float,
+) -> Dict:
+    """
+    Compare actual portfolio vs optimal portfolios and produce a risk verdict.
+
+    risk_score:
+      0   = minimum-variance frontier
+      1   = max-Sharpe frontier (sweet spot)
+      >1  = beyond max-Sharpe (over-concentrated)
+    """
+    mean_ret = opt["mean_ret"]
+    cov      = opt["cov"]
+    tickers  = opt["tickers"]
+
+    w = actual_weights.reindex(tickers).fillna(0) / 100
+    if w.sum() > 0:
+        w = w / w.sum()
+
+    r_act, v_act, s_act = _portfolio_stats(w.values, mean_ret, cov)
+    _, v_sharpe, _      = _portfolio_stats(opt["max_sharpe"].values, mean_ret, cov)
+    _, v_minvol, _      = _portfolio_stats(opt["min_vol"].values,    mean_ret, cov)
+
+    vol_range  = v_sharpe - v_minvol
+    risk_score = (v_act - v_minvol) / vol_range if vol_range > 1e-6 else 0.5
+
+    if risk_score < 0.2:
+        verdict = "UNDER-RISKED — too conservative; consider adding higher-return assets"
+    elif risk_score > 1.5:
+        verdict = "OVER-RISKED — concentration is high; trim largest positions"
+    elif 0.8 <= risk_score <= 1.2:
+        verdict = "ON TARGET — actual risk is close to the max-Sharpe optimum"
+    else:
+        verdict = "SLIGHTLY OFF — modest rebalancing toward max-Sharpe weights is beneficial"
+
+    if avg_pairwise_corr < 0.2:
+        div_verdict = "EXCELLENT — low cross-asset correlation"
+    elif avg_pairwise_corr < 0.4:
+        div_verdict = "GOOD — moderate diversification"
+    elif avg_pairwise_corr < 0.6:
+        div_verdict = "FAIR — some clustering; seek low-correlation additions"
+    else:
+        div_verdict = "POOR — assets move together; portfolio poorly diversified"
+
+    return {
+        "actual_return":   r_act,
+        "actual_vol":      v_act,
+        "actual_sharpe":   s_act,
+        "sharpe_vol":      v_sharpe,
+        "minvol_vol":      v_minvol,
+        "risk_score":      risk_score,
+        "verdict":         verdict,
+        "avg_correlation": avg_pairwise_corr,
+        "div_verdict":     div_verdict,
+    }
+
+
+# ── Console report ─────────────────────────────────────────────────────────────
+
+def print_report(
+    opt: Dict,
+    actual_weights: pd.Series,
+    risk: Dict,
+    name_map: Dict[str, str] = None,
+) -> None:
+    name_map = name_map or {}
+    print()
+    print("═" * 80)
+    print("  MARKOWITZ PORTFOLIO ANALYSIS")
+    print("═" * 80)
+
+    print("\n  Reference portfolios:")
+    print(opt["stats_df"].to_string(index=False))
+
+    print(f"\n  Your actual portfolio:")
+    print(f"    Annualised return  : {risk['actual_return']*100:+.2f}%")
+    print(f"    Annualised vol     : {risk['actual_vol']*100:.2f}%")
+    print(f"    Sharpe ratio       : {risk['actual_sharpe']:.3f}  "
+          f"(risk-free rate = {RISK_FREE_RATE*100:.1f}%)")
+
+    print(f"\n  Risk score  : {risk['risk_score']:.2f}  "
+          f"(0 = min-vol, 1 = max-Sharpe, >1 = over-concentrated)")
+    print(f"  Assessment  : {risk['verdict']}")
+
+    print(f"\n  Avg pairwise correlation : {risk['avg_correlation']:+.3f}")
+    print(f"  Diversification          : {risk['div_verdict']}")
+
+    print("\n  Max-Sharpe weights vs your actual weights:")
+    header = f"  {'Ticker':<12} {'Name':<28} {'Optimal':>8}   {'Actual':>8}   {'Delta':>8}"
+    print(header)
+    print("  " + "-" * 68)
+    for t in opt["tickers"]:
+        optimal = opt["max_sharpe"][t] * 100
+        actual  = actual_weights.get(t, 0.0)
+        delta   = optimal - actual
+        arrow   = "↑" if delta > 1 else ("↓" if delta < -1 else "~")
+        name    = name_map.get(t, "")[:27]
+        print(f"  {t:<12} {name:<28} {optimal:>7.1f}%   {actual:>7.1f}%   "
+              f"{arrow}{abs(delta):.1f}pp")
+    print("═" * 80)
+
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+
+def _chart_label(ticker: str, name_map: Dict[str, str], max_len: int = 20) -> str:
+    """Return 'TICKER\nFull Name' for chart axes, falling back to ticker alone."""
+    name = name_map.get(ticker, "")
+    if name and name not in ("Unknown", "N/A", ""):
+        return f"{ticker}\n{name[:max_len]}"
+    return ticker
+
+
+def plot_markowitz(
+    opt: Dict,
+    actual_weights: pd.Series,
+    risk: Dict,
+    corr: pd.DataFrame,
+    name_map: Dict[str, str] = None,
+    out_path: str = "markowitz.png",
+) -> None:
+    name_map = name_map or {}
+    _dark_theme()
+    fig = plt.figure(figsize=(24, 10), facecolor=_DARK_BG)
+    fig.suptitle("MARKOWITZ PORTFOLIO OPTIMIZATION", color=_TEXT,
+                 fontsize=16, fontweight="bold", y=1.01)
+
+    tickers  = opt["tickers"]
+    mean_ret = opt["mean_ret"]
+    cov      = opt["cov"]
+    n        = len(tickers)
+
+    ax_front  = fig.add_subplot(1, 4, 1)
+    ax_weights= fig.add_subplot(1, 4, 2)
+    ax_corr   = fig.add_subplot(1, 4, 3)
+    ax_gauge  = fig.add_subplot(1, 4, 4)
+
+    # ── Efficient frontier (Monte Carlo) ──────────────────────────────────────
+    mc_ret, mc_vol, mc_sharpe = [], [], []
+    rng = np.random.default_rng(42)
+    for _ in range(4000):
+        w = rng.dirichlet(np.ones(n))
+        r, v, s = _portfolio_stats(w, mean_ret, cov)
+        mc_ret.append(r * 100)
+        mc_vol.append(v * 100)
+        mc_sharpe.append(s)
+
+    sc = ax_front.scatter(mc_vol, mc_ret, c=mc_sharpe, cmap="viridis",
+                          s=4, alpha=0.55, zorder=2)
+    fig.colorbar(sc, ax=ax_front, label="Sharpe", fraction=0.03, pad=0.02)
+
+    def _point(ax, label, w_series, marker, color):
+        r, v, _ = _portfolio_stats(w_series.values, mean_ret, cov)
+        ax.scatter(v * 100, r * 100, marker=marker, s=200, color=color,
+                   zorder=5, label=label, edgecolors="white", linewidths=0.5)
+
+    _point(ax_front, "Max Sharpe",    opt["max_sharpe"], "*", _GOLD)
+    _point(ax_front, "Min Vol",       opt["min_vol"],    "D", _ACCENT2)
+
+    w_act = actual_weights.reindex(tickers).fillna(0) / 100
+    if w_act.sum() > 0:
+        w_act = w_act / w_act.sum()
+    _point(ax_front, "Your Portfolio",
+           pd.Series(w_act.values, index=tickers), "o", _WARN)
+
+    ax_front.set_xlabel("Annual Volatility (%)", fontsize=9)
+    ax_front.set_ylabel("Annual Return (%)",     fontsize=9)
+    ax_front.set_title("Efficient Frontier",     color=_TEXT, fontsize=11, fontweight="bold")
+    ax_front.legend(fontsize=8, loc="upper left")
+    ax_front.grid(True, alpha=0.15)
+
+    # ── Weight comparison ─────────────────────────────────────────────────────
+    x    = np.arange(n)
+    w_s  = [opt["max_sharpe"][t] * 100 for t in tickers]
+    w_a  = [actual_weights.get(t, 0.0) for t in tickers]
+
+    ax_weights.bar(x - 0.2, w_s, 0.38, label="Max Sharpe", color=_ACCENT1, alpha=0.85)
+    ax_weights.bar(x + 0.2, w_a, 0.38, label="Actual",     color=_WARN,    alpha=0.85)
+    ax_weights.set_xticks(x)
+    ax_weights.set_xticklabels(
+        [_chart_label(t, name_map, max_len=18) for t in tickers],
+        rotation=45, ha="right", fontsize=7,
+    )
+    ax_weights.set_ylabel("Weight (%)", fontsize=9)
+    ax_weights.set_title("Optimal vs Actual Weights", color=_TEXT, fontsize=11, fontweight="bold")
+    ax_weights.legend(fontsize=8)
+    ax_weights.grid(axis="y", alpha=0.15)
+
+    # ── Correlation heatmap ───────────────────────────────────────────────────
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap_corr = LinearSegmentedColormap.from_list(
+        "fin", ["#C0392B", _PANEL_BG, "#2980B9"], N=256
+    )
+    im = ax_corr.imshow(corr.values, cmap=cmap_corr, vmin=-1, vmax=1, aspect="auto")
+    fig.colorbar(im, ax=ax_corr, fraction=0.03, pad=0.02)
+    ax_corr.set_xticks(range(n))
+    ax_corr.set_yticks(range(n))
+    corr_labels = [_chart_label(t, name_map, max_len=16) for t in tickers]
+    ax_corr.set_xticklabels(corr_labels, rotation=45, ha="right", fontsize=7, color=_TEXT)
+    ax_corr.set_yticklabels(corr_labels, fontsize=7, color=_TEXT)
+    for i in range(n):
+        for j in range(n):
+            ax_corr.text(j, i, f"{corr.iloc[i,j]:.2f}",
+                         ha="center", va="center", fontsize=6,
+                         color="white" if abs(corr.iloc[i, j]) > 0.5 else _DIM)
+    ax_corr.set_title("Correlation Matrix", color=_TEXT, fontsize=11, fontweight="bold")
+
+    # ── Risk gauge ────────────────────────────────────────────────────────────
+    zones  = ["Min Vol", "Conservative", "Balanced", "Max Sharpe", "Aggressive", "Concentrated"]
+    colors = [_ACCENT2, _ACCENT1, "#D29922", _GOLD, _WARN, "#C0392B"]
+    bar_w  = 1.0
+    for i, (label, color) in enumerate(zip(zones, colors)):
+        ax_gauge.barh(0, bar_w, left=i * bar_w, color=color, height=0.5, alpha=0.8)
+        ax_gauge.text(i * bar_w + bar_w / 2, -0.38, label,
+                      ha="center", fontsize=7, color=_DIM)
+
+    score     = min(max(risk["risk_score"], 0), 2)
+    marker_x  = score * (len(zones) - 1) / 2 * bar_w
+    ax_gauge.scatter([marker_x], [0], s=350, color="white", zorder=5, marker="v")
+    ax_gauge.text(marker_x, 0.28, f"score\n{score:.2f}",
+                  ha="center", fontsize=8, color=_TEXT, fontweight="bold")
+
+    verdict_parts = risk["verdict"].split(" — ", 1)
+    ax_gauge.set_title(f"{verdict_parts[0]}",
+                       color=_GOLD, fontsize=11, fontweight="bold")
+    if len(verdict_parts) > 1:
+        ax_gauge.set_xlabel(verdict_parts[1], fontsize=8, color=_DIM, labelpad=8)
+
+    ax_gauge.set_xlim(0, len(zones) * bar_w)
+    ax_gauge.set_ylim(-0.65, 0.65)
+    ax_gauge.axis("off")
+
+    fig.text(0.5, -0.05,
+             f"Avg pairwise correlation: {risk['avg_correlation']:+.3f}   ·   "
+             f"Diversification: {risk['div_verdict']}",
+             ha="center", fontsize=9, color=_DIM)
+    fig.text(0.99, -0.05, "T-Invest Portfolio Analytics · Markowitz",
+             ha="right", fontsize=8, color=_DIM, style="italic")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=180, bbox_inches="tight", facecolor=_DARK_BG)
+    plt.close(fig)
+    print(f"✓ Chart saved → {out_path}")
+
+
+# ── CLI entry point ────────────────────────────────────────────────────────────
+
+def _parse_args() -> Tuple[int, int | None, str]:
+    days   = 365
+    top_n  = None
+    method = "pearson"
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg.isdigit():
+            days = int(arg)
+        elif arg == "--spearman":
+            method = "spearman"
+        elif arg == "--top" and i + 1 < len(sys.argv):
+            top_n = int(sys.argv[i + 1])
+            i += 1
+        i += 1
+    return days, top_n, method
+
+
+def main() -> None:
+    days, top_n, corr_method = _parse_args()
+
+    logger.info("Connecting to T-Invest API…")
+    with Client(TOKEN) as client:
+        rates     = get_rates(client)
+        positions = fetch_all_positions(client, rates)
+    logger.info("Fetched %d positions", len(positions))
+
+    figi_map = build_figi_map(positions, top_n=top_n)
+    if len(figi_map) < 2:
+        print("⚠  Not enough tradable assets for Markowitz analysis.")
+        return
+
+    print(f"Loading {days}-day price history for {len(figi_map)} assets…")
+    history = fetch_price_history(figi_map, days=days)
+    if len(history) < 2:
+        print("⚠  Could not load sufficient price history.")
+        return
+
+    try:
+        returns = build_returns_matrix(history)
+    except ValueError as e:
+        print(f"⚠  {e}")
+        return
+
+    corr, _ = compute_correlation(returns, method=corr_method)
+
+    tickers  = list(corr.columns)
+    off_diag = [corr.iloc[i, j]
+                for i in range(len(tickers))
+                for j in range(i)]
+    avg_corr = float(np.mean(off_diag)) if off_diag else 0.0
+
+    opt      = optimize_portfolio(returns)
+    actual_w = portfolio_weights(positions, opt["tickers"])
+    risk     = estimate_risk(actual_w, opt, avg_corr)
+
+    name_map = {p["ticker"]: p["name"] for p in positions if p.get("ticker") and p.get("name")}
+
+    print_report(opt, actual_w, risk, name_map)
+    plot_markowitz(opt, actual_w, risk, corr, name_map)
+
+
+if __name__ == "__main__":
+    main()

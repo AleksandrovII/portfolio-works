@@ -121,12 +121,15 @@ def get_portfolio_summary(account_id: str, client: Client, currency_rates: Dict[
     for pos in portfolio.positions:
         instrument_info = get_instrument_info_by_figi(client, pos.figi) or {
             "name": "Неизвестный инструмент",
-            "ticker": pos.figi[:10],  # Берем часть FIGI как тикер
+            "ticker": pos.figi[:10],
             "currency": "N/A",
             "lot": 1,
             "instrument_type": "N/A"
         }
-        
+
+        if instrument_info.get("instrument_type") == "unknown":
+            continue  # дериватив — пропускаем
+
         # Расчёт стоимости позиции
         value_info = calculate_position_value(pos, currency_rates)
         

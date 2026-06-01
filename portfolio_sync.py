@@ -98,6 +98,8 @@ def get_portfolio(client, account_id, rates):
         
         for pos in portfolio.positions:
             info = get_instrument_info(client, pos.figi)
+            if info.get("instrument_type") == "unknown":
+                continue  # дериватив — пропускаем
             value = calculate_position_value(pos, rates, info["currency"])
             
             current_price = None
@@ -422,6 +424,8 @@ def main():
                     instrument_info = {"ticker": "N/A", "name": "N/A", "type": "N/A"}
                     if hasattr(op, 'figi') and op.figi:
                         instrument_info = get_instrument_info_cached(client, op.figi)
+                    if instrument_info.get("type") == "unknown":
+                        continue  # дериватив — пропускаем
 
                     # Сумма операции (берём модуль, чтобы избавиться от минуса)
                     amount = Decimal('0')
