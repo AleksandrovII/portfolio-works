@@ -1,0 +1,15 @@
+# Generated data files — contain private financial data
+data/portfolio.csv
+data/deals.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
