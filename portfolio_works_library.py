@@ -13,18 +13,28 @@ import logging
 import os
 from datetime import timedelta
 from decimal import Decimal
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from t_tech.invest import AsyncClient, Client, CandleInterval
 from t_tech.invest.utils import now
 
+try:
+    from finam_trade_api import TokenManager
+    from finam_trade_api.access import TokenClient
+    from finam_trade_api.account import AccountClient
+    _FINAM_SDK = True
+except ImportError:
+    _FINAM_SDK = False
+
 logger = logging.getLogger(__name__)
 
 TOKEN: str = os.getenv("INVEST_TOKEN", "")
 if not TOKEN:
     raise SystemExit("INVEST_TOKEN not set. Run:  export INVEST_TOKEN='your_token'")
+
+FINAM_TOKEN: str = os.getenv("FINAM_TOKEN", "")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -369,3 +379,104 @@ def portfolio_weights_from_csv(
         {t: agg.get(t, 0.0) / total * 100 for t in tickers},
         name="weight_pct",
     )
+
+
+# ── Finam Trade API ────────────────────────────────────────────────────────────
+
+_FINAM_SKIP_TYPES = {"FORTS"}
+
+
+def _dec(val: Any) -> Decimal:
+    """Convert FinamDecimal / dict / str / number to Decimal."""
+    if val is None:
+        return Decimal("0")
+    if hasattr(val, "value"):
+        return Decimal(val.value or "0")
+    if isinstance(val, dict):
+        return Decimal(str(val.get("value", 0) or 0))
+    return Decimal(str(val))
+
+
+async def _finam_fetch_async() -> List[Dict]:
+    tm = TokenManager(token=FINAM_TOKEN)
+    tc = TokenClient(token_manager=tm)
+    await tc.set_jwt_token()
+    details = await tc.get_jwt_token_details()
+    logger.info("Finam: %d accounts found", len(details.account_ids))
+
+    ac = AccountClient(token_manager=tm)
+    rows: List[Dict] = []
+
+    for acc_id in details.account_ids:
+        resp, ok = await ac._exec_request("GET", f"/accounts/{acc_id}")
+        if not ok:
+            logger.warning("Finam: account %s error: %s", acc_id, resp)
+            continue
+        if resp.get("type", "") in _FINAM_SKIP_TYPES:
+            continue
+
+        account_name = f"Finam {acc_id}"
+
+        for pos in resp.get("positions", []):
+            symbol = str(pos.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            qty       = _dec(pos.get("quantity"))
+            avg_price = _dec(pos.get("average_price"))
+            cur_price = _dec(pos.get("current_price"))
+            if qty == 0:
+                continue
+            rows.append({
+                "account":         account_name,
+                "figi":            "",
+                "name":            symbol,
+                "ticker":          symbol,
+                "currency":        "rub",
+                "instrument_type": "share",
+                "quantity":        qty,
+                "avg_price":       avg_price,
+                "cur_price":       cur_price,
+                "rub_value":       cur_price * qty,
+            })
+
+        for cash in resp.get("cash", []):
+            currency = str(cash.get("currency_code") or "").lower()
+            units    = str(cash.get("units") or "0")
+            nanos    = int(cash.get("nanos") or 0)
+            balance  = Decimal(units) + Decimal(nanos) / Decimal(1_000_000_000)
+            if balance <= 0:
+                continue
+            rows.append({
+                "account":         account_name,
+                "figi":            "",
+                "name":            f"Деньги ({currency.upper()})",
+                "ticker":          currency.upper(),
+                "currency":        currency,
+                "instrument_type": "currency",
+                "quantity":        Decimal("1"),
+                "avg_price":       balance,
+                "cur_price":       balance,
+                "rub_value":       balance,
+            })
+
+    logger.info("Finam: %d positions total", len(rows))
+    return rows
+
+
+def fetch_finam_positions() -> List[Dict]:
+    """
+    Fetch positions from Finam Trade API.
+
+    Returns [] if FINAM_TOKEN is not set, SDK not installed, or on error.
+    """
+    if not FINAM_TOKEN:
+        logger.info("FINAM_TOKEN not set — Finam skipped.")
+        return []
+    if not _FINAM_SDK:
+        logger.warning("finam-trade-api not installed — run: pip install finam-trade-api")
+        return []
+    try:
+        return asyncio.run(_finam_fetch_async())
+    except Exception as exc:
+        logger.error("Finam API error: %s", exc)
+        return []

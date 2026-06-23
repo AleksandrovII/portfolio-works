@@ -26,8 +26,7 @@ from datetime import datetime, timezone
 import pandas as pd
 from t_tech.invest import Client
 
-from portfolio_works_library import TOKEN, get_rates, fetch_all_positions
-from finam_library import fetch_finam_positions
+from portfolio_works_library import TOKEN, get_rates, fetch_all_positions, fetch_finam_positions
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
