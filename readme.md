@@ -11,7 +11,6 @@ export INVEST_TOKEN='ваш_токен'
 # Полная настройка — T-Invest + Финам
 export INVEST_TOKEN='ваш_токен_тинвест'
 export FINAM_TOKEN='ваш_токен_финам'
-export FINAM_CLIENT_ID='123456'
 ```
 
 ---
