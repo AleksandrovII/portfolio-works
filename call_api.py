@@ -1,14 +1,20 @@
 """
 call_api.py
 -----------
-Fetches a current portfolio snapshot from T-Invest API and saves it to
-data/portfolio.csv.
+Fetches portfolio snapshot from T-Invest API (and optionally Finam),
+then saves all positions to data/portfolio.csv.
 
 Run this script once before using any Instruments scripts.  Re-run any time
 you want to refresh prices and positions.
 
 Usage:
+    # T-Invest only (minimum setup)
     export INVEST_TOKEN='your_token'
+
+    # T-Invest + Finam
+    export INVEST_TOKEN='your_tinvest_token'
+    export FINAM_TOKEN='your_finam_token'
+
     /opt/miniconda3/bin/python call_api.py
 """
 
@@ -21,6 +27,7 @@ import pandas as pd
 from t_tech.invest import Client
 
 from portfolio_works_library import TOKEN, get_rates, fetch_all_positions
+from finam_library import fetch_finam_positions
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -82,13 +89,19 @@ def main() -> None:
     with Client(TOKEN) as client:
         rates     = get_rates(client)
         positions = fetch_all_positions(client, rates)
-    logger.info("Fetched %d positions", len(positions))
+    logger.info("T-Invest: fetched %d positions", len(positions))
 
-    if not positions:
-        logger.error("No positions found — check your token and accounts.")
+    finam_positions = fetch_finam_positions()
+    if finam_positions:
+        logger.info("Finam: fetched %d positions", len(finam_positions))
+
+    all_positions = positions + finam_positions
+
+    if not all_positions:
+        logger.error("No positions found — check your tokens and accounts.")
         return
 
-    df = _build_snapshot(positions)
+    df = _build_snapshot(all_positions)
 
     DATA_DIR.mkdir(exist_ok=True)
     df.to_csv(SNAPSHOT_PATH, index=False)
