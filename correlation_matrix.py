@@ -1,380 +1,365 @@
 """
-Portfolio asset correlation matrix.
+correlation_matrix.py
+---------------------
+Reads data/portfolio.csv, fetches daily price history from T-Invest API for
+shares and ETFs, computes Pearson (or Spearman) correlation on log-returns,
+and saves a heatmap PNG plus CSV exports to Results/.
 
-Fetches daily candles from T-Invest, aligns prices by date, computes Pearson
-(or Spearman) correlation on log-returns, and produces heatmap + CSV exports.
+Usage:
+    export INVEST_TOKEN='your_token'
+    /opt/miniconda3/bin/python correlation_matrix.py              # 2-year window
+    /opt/miniconda3/bin/python correlation_matrix.py 365          # 1-year window
+    /opt/miniconda3/bin/python correlation_matrix.py --top 8      # top-8 by value
+    /opt/miniconda3/bin/python correlation_matrix.py --spearman
 """
 
 from __future__ import annotations
 
-import asyncio
+import argparse
 import logging
-from dataclasses import dataclass
-from datetime import timedelta
-from typing import Dict, List, Literal, Optional, Tuple
+import pathlib
+import sys
+from datetime import date, timedelta
+from typing import Dict, Optional, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from scipy.stats import pearsonr, spearmanr
 
-from t_tech.invest import AsyncClient, CandleInterval
-from t_tech.invest.utils import now
+_ROOT    = pathlib.Path(__file__).parent
+sys.path.insert(0, str(_ROOT))
 
+from portfolio_works_library import (
+    CURRENCY_FIGI,
+    CorrMethod,
+    build_figi_map_from_csv,
+    build_returns_matrix,
+    fetch_price_history,
+    portfolio_weights_from_csv,
+)
+
+SNAPSHOT  = _ROOT / "data" / "portfolio.csv"
+RESULTS   = _ROOT / "Results"
+OUT_PNG   = RESULTS / "correlation_matrix.png"
+OUT_CSV   = RESULTS / "correlation_matrix.csv"
+OUT_PAIRS = RESULTS / "correlation_pairs.csv"
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TRADABLE_TYPES = {'share', 'bond', 'etf', 'precious_metal'}
-ReturnMethod = Literal['log', 'simple']
-CorrMethod = Literal['pearson', 'spearman']
+INCLUDE_TYPES = {"share", "etf"}
 
-# Bloomberg-style palette (shared with tinvest_to_finance charts)
-_DARK_BG = '#0D1117'
-_PANEL_BG = '#161B22'
-_TEXT = '#E6EDF3'
-_DIM = '#8B949E'
-_GRID = '#30363D'
-_ACCENT1 = '#58A6FF'
+# External market indicators fetched via Yahoo Finance (pip install yfinance)
+# Brent is the closest free proxy for Urals (r ≈ 0.99, Urals = Brent − discount)
+# Nutrien (NTR) is the world's largest fertilizer producer — proxy for fertilizer prices
+EXTERNAL_TICKERS: Dict[str, str] = {
+    "BZ=F": "BRENT",    # Brent crude futures — closest free proxy for Urals
+    "NTR":  "NUTRIEN",  # Nutrien Ltd (NYSE) — fertilizer proxy
+}
 
+# MOEX indices fetched directly from MOEX ISS (more reliable than Yahoo Finance for RU indices)
+MOEX_INDICES: Dict[str, tuple] = {
+    "IMOEX": ("stock", "index", "SNDX"),   # Moscow Exchange Index (RUB)
+    "RTSI":  ("stock", "index", "RTSI"),   # RTS Index (USD-denominated)
+}
 
-@dataclass
-class CorrelationResult:
-    """Correlation analysis output."""
+# ── Dark theme ──────────────────────────────────────────────────────────────────
 
-    corr: pd.DataFrame
-    pvalues: pd.DataFrame
-    returns: pd.DataFrame
-    weights: pd.Series
-    days: int
-    tickers: List[str]
-    corr_method: CorrMethod = 'pearson'
-    return_method: ReturnMethod = 'log'
-
-
-def build_figi_map(
-    positions: List[Dict],
-    *,
-    min_weight_pct: float = 0.0,
-    top_n: Optional[int] = None,
-) -> Dict[str, str]:
-    """
-    Map FIGI → ticker for tradable portfolio positions.
-
-    Optionally filter to positions above min_weight_pct of total RUB value,
-    or keep only the top_n largest by weight.
-    """
-    total_rub = sum(float(p.get('rub_value') or 0) for p in positions)
-    candidates: List[Tuple[float, str, str]] = []
-
-    for p in positions:
-        if p.get('instrument_type') not in TRADABLE_TYPES:
-            continue
-        figi = p.get('figi', '')
-        ticker = p.get('ticker', figi[:6] if figi else '')
-        if not figi or not ticker:
-            continue
-        rub = float(p.get('rub_value') or 0)
-        weight = (rub / total_rub * 100) if total_rub > 0 else 0.0
-        if weight < min_weight_pct:
-            continue
-        candidates.append((rub, figi, ticker))
-
-    if top_n is not None and top_n > 0:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        candidates = candidates[:top_n]
-
-    figi_map: Dict[str, str] = {}
-    seen: set = set()
-    for _, figi, ticker in sorted(candidates, key=lambda x: x[0], reverse=True):
-        if ticker in seen:
-            continue
-        figi_map[figi] = ticker
-        seen.add(ticker)
-    return figi_map
+_DARK_BG  = "#0D1117"
+_PANEL_BG = "#161B22"
+_TEXT     = "#E6EDF3"
+_DIM      = "#8B949E"
+_GRID     = "#30363D"
+_ACCENT1  = "#58A6FF"
 
 
-async def _get_candles(
-    client: AsyncClient,
-    figi: str,
-    days: int,
-) -> Optional[pd.Series]:
-    """Daily close prices indexed by UTC date."""
-    try:
-        end = now()
-        start = end - timedelta(days=days)
-        resp = await client.market_data.get_candles(
-            instrument_id=figi,
-            from_=start,
-            to=end,
-            interval=CandleInterval.CANDLE_INTERVAL_DAY,
+def _dark_theme() -> None:
+    plt.rcParams.update({
+        "figure.facecolor": _DARK_BG, "axes.facecolor":  _PANEL_BG,
+        "axes.edgecolor":   _GRID,    "axes.labelcolor":  _DIM,
+        "text.color":       _TEXT,    "xtick.color":      _DIM,
+        "ytick.color":      _DIM,     "grid.color":       _GRID,
+        "font.family":      "sans-serif",
+    })
+
+
+# ── MOEX index history ─────────────────────────────────────────────────────────
+
+def fetch_moex_indices(days: int) -> Dict[str, pd.Series]:
+    """Fetch IMOEX and RTSI history from MOEX ISS (free, no auth)."""
+    import time
+    import requests as _req
+
+    start = (date.today() - timedelta(days=days)).isoformat()
+    end   = date.today().isoformat()
+    result: Dict[str, pd.Series] = {}
+
+    for label, (engine, market, board) in MOEX_INDICES.items():
+        url = (
+            f"https://iss.moex.com/iss/history/engines/{engine}/markets/{market}"
+            f"/boards/{board}/securities/{label}.json"
         )
         rows = []
-        for c in resp.candles:
-            if not c.close or not c.time:
+        start_row = 0
+        while True:
+            try:
+                resp = _req.get(url, params={"from": start, "till": end,
+                                             "start": start_row, "limit": 100}, timeout=15)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+            except Exception as e:
+                logger.warning("MOEX ISS error for %s: %s", label, e)
+                break
+
+            hist    = data.get("history", {})
+            cols    = hist.get("columns", [])
+            records = hist.get("data", [])
+            if not records:
+                break
+
+            try:
+                date_idx  = cols.index("TRADEDATE")
+                value_idx = cols.index("CLOSE")
+            except ValueError:
+                break
+
+            for row in records:
+                d, v = row[date_idx], row[value_idx]
+                if d and v is not None:
+                    rows.append((pd.Timestamp(d), float(v)))
+
+            cursor = data.get("history.cursor", {}).get("data", [])
+            if cursor:
+                idx, total, pagesize = cursor[0]
+                if idx + pagesize >= total:
+                    break
+                start_row = idx + pagesize
+                time.sleep(0.2)
+            else:
+                break
+
+        if len(rows) > 10:
+            s = pd.Series({ts: px for ts, px in rows}, dtype=float).sort_index()
+            result[label] = s[~s.index.duplicated(keep="last")]
+            logger.info("  %-14s %d days loaded (MOEX ISS)", label, len(result[label]))
+        else:
+            logger.warning("  %-14s no index data from MOEX ISS", label)
+
+    return result
+
+
+# ── External market data (Yahoo Finance) ───────────────────────────────────────
+
+def fetch_external_prices(days: int) -> Dict[str, pd.Series]:
+    """
+    Fetch daily close prices from Yahoo Finance for external indicators.
+    Returns empty dict (with warning) if yfinance is not installed.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("⚠  yfinance not installed — run: pip install yfinance")
+        return {}
+
+    start = (date.today() - timedelta(days=days)).isoformat()
+    end   = date.today().isoformat()
+    result: Dict[str, pd.Series] = {}
+
+    for yf_ticker, label in EXTERNAL_TICKERS.items():
+        try:
+            hist = yf.Ticker(yf_ticker).history(start=start, end=end)
+            if hist.empty:
+                logger.warning("  %-14s no data from Yahoo Finance", label)
                 continue
-            price = float(c.close.units) + float(c.close.nano) / 1e9
-            rows.append((pd.Timestamp(c.time).normalize(), price))
-        if len(rows) <= 10:
-            return None
-        series = pd.Series(
-            {ts: px for ts, px in rows},
-            dtype=float,
-        ).sort_index()
-        return series[~series.index.duplicated(keep='last')]
-    except Exception as e:
-        logger.warning('No history for %s: %s', figi, e)
-        return None
+            s = hist["Close"].dropna()
+            idx = pd.to_datetime(s.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert("UTC").tz_localize(None)
+            s.index = idx.normalize()
+            if len(s) > 10:
+                result[label] = s
+                logger.info("  %-14s %d days loaded (Yahoo Finance)", label, len(s))
+            else:
+                logger.warning("  %-14s too few data points", label)
+        except Exception as e:
+            logger.warning("  %-14s Yahoo Finance error: %s", label, e)
+
+    return result
 
 
-async def fetch_price_history(
-    figi_map: Dict[str, str],
-    days: int,
-    token: str,
-) -> Dict[str, pd.Series]:
-    """Fetch aligned daily close series for each FIGI."""
-    async with AsyncClient(token) as client:
-        figis = list(figi_map.keys())
-        results = await asyncio.gather(
-            *[_get_candles(client, f, days) for f in figis],
-            return_exceptions=True,
-        )
-    history: Dict[str, pd.Series] = {}
-    for figi, res in zip(figis, results):
-        if isinstance(res, pd.Series):
-            history[figi_map[figi]] = res
-    return history
+# ── Portfolio loading ───────────────────────────────────────────────────────────
+
+def load_snapshot(top_n: Optional[int] = None) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Load portfolio.csv filtered to shares and ETFs (no futures).
+
+    Returns (df, figi_map) where figi_map is {figi: ticker}.
+    """
+    if not SNAPSHOT.exists():
+        sys.exit(f"Portfolio snapshot not found: {SNAPSHOT}\nRun call_api.py first.")
+
+    df = pd.read_csv(SNAPSHOT)
+    df["rub_value"]  = pd.to_numeric(df["rub_value"],  errors="coerce").fillna(0)
+    df["weight_pct"] = pd.to_numeric(df["weight_pct"], errors="coerce").fillna(0)
+
+    df = df[~df["figi"].str.startswith("FUT", na=False)]
+    df = df[df["instrument_type"].isin(INCLUDE_TYPES)]
+
+    figi_map = build_figi_map_from_csv(df, top_n=top_n)
+    return df, figi_map
 
 
-def build_returns_matrix(
-    history: Dict[str, pd.Series],
-    method: ReturnMethod = 'log',
-) -> pd.DataFrame:
-    """Align prices on common trading dates and compute returns."""
-    if len(history) < 2:
-        raise ValueError('Need at least two assets with price history')
-
-    prices = pd.DataFrame(history).dropna(how='all')
-    prices = prices.dropna(how='any')
-    if len(prices) < 11:
-        raise ValueError(
-            f'Insufficient overlapping history ({len(prices)} days); need ≥11'
-        )
-
-    if method == 'log':
-        return np.log(prices / prices.shift(1)).dropna()
-    return prices.pct_change().dropna()
-
-
-def _pair_pvalue(
-    x: pd.Series,
-    y: pd.Series,
-    method: CorrMethod,
-) -> float:
-    mask = x.notna() & y.notna()
-    a, b = x[mask], y[mask]
-    if len(a) < 3:
-        return 1.0
-    if method == 'spearman':
-        _, p = spearmanr(a, b)
-    else:
-        _, p = pearsonr(a, b)
-    return float(p)
-
+# ── Correlation ─────────────────────────────────────────────────────────────────
 
 def compute_correlation(
     returns: pd.DataFrame,
-    method: CorrMethod = 'pearson',
+    method: CorrMethod = "pearson",
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Correlation matrix and pairwise p-values."""
     corr = returns.corr(method=method)
-    n = len(corr)
-    pval = pd.DataFrame(
-        np.ones((n, n)),
-        index=corr.index,
-        columns=corr.columns,
-    )
+    n    = len(corr)
+    pval = pd.DataFrame(np.ones((n, n)), index=corr.index, columns=corr.columns)
+    fn   = spearmanr if method == "spearman" else pearsonr
     for i in corr.index:
         for j in corr.columns:
-            if i != j:
-                pval.loc[i, j] = _pair_pvalue(returns[i], returns[j], method)
-            else:
+            if i == j:
                 pval.loc[i, j] = 0.0
+                continue
+            a, b = returns[i].dropna(), returns[j].dropna()
+            idx  = a.index.intersection(b.index)
+            if len(idx) >= 3:
+                _, p = fn(a[idx], b[idx])
+                pval.loc[i, j] = float(p)
     return corr, pval
 
 
-def portfolio_weights(
-    positions: List[Dict],
-    tickers: List[str],
-) -> pd.Series:
-    """RUB weight (%) per ticker for assets in the correlation set."""
-    rub_by_ticker: Dict[str, float] = {}
-    for p in positions:
-        t = p.get('ticker', '')
-        if t not in tickers:
-            continue
-        rub_by_ticker[t] = rub_by_ticker.get(t, 0.0) + float(p.get('rub_value') or 0)
-    total = sum(rub_by_ticker.values())
-    if total <= 0:
-        return pd.Series(0.0, index=tickers)
-    return pd.Series(
-        {t: rub_by_ticker.get(t, 0) / total * 100 for t in tickers},
-        name='weight_pct',
-    )
+# ── Console report ──────────────────────────────────────────────────────────────
 
-
-def print_summary(result: CorrelationResult) -> None:
-    """Print correlation matrix and highlight pairs to console."""
-    corr, pval = result.corr, result.pvalues
+def print_report(
+    corr: pd.DataFrame,
+    pval: pd.DataFrame,
+    weights: pd.Series,
+    days: int,
+    method: str,
+) -> None:
     n = len(corr)
-
-    print('\n' + '═' * 72)
-    print(f'  CORRELATION MATRIX  ·  {result.days}d  ·  {n} assets  ·  '
-          f'{len(result.returns)} return observations')
-    print('═' * 72)
+    print()
+    print("═" * 72)
+    print(f"  ASSET CORRELATION MATRIX  ·  {days}d  ·  {n} assets  ·  {method}")
+    print("═" * 72)
 
     col_w = max(8, max(len(t) for t in corr.columns) + 1)
-    header = f"{'':>{col_w}}" + ''.join(f'{t:>{col_w}}' for t in corr.columns)
-    print(header)
+    print(f"{'':>{col_w}}" + "".join(f"{t:>{col_w}}" for t in corr.columns))
     for i in corr.index:
-        row = f'{i:>{col_w}}'
+        row = f"{i:>{col_w}}"
         for j in corr.columns:
-            v = corr.loc[i, j]
-            cell = '1.00' if i == j else f'{v:+.2f}'
-            row += f'{cell:>{col_w}}'
+            cell = "1.00" if i == j else f"{corr.loc[i,j]:+.2f}"
+            row += f"{cell:>{col_w}}"
         print(row)
 
-    off_diag = []
-    for i, a in enumerate(corr.index):
-        for j, b in enumerate(corr.columns):
-            if j >= i:
-                continue
-            off_diag.append((corr.loc[a, b], pval.loc[a, b], a, b))
-    if not off_diag:
-        print('═' * 72 + '\n')
+    off = sorted(
+        [
+            (corr.iloc[i, j], pval.iloc[i, j], corr.index[i], corr.columns[j])
+            for i in range(n)
+            for j in range(i)
+        ],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    if not off:
+        print("═" * 72)
         return
 
-    avg = float(np.mean([x[0] for x in off_diag]))
-    print(f'\n  Average pairwise correlation: {avg:.3f}')
+    avg = float(np.mean([x[0] for x in off]))
+    print(f"\n  Average pairwise correlation: {avg:.3f}")
 
-    if not result.weights.empty:
-        print('\n  Portfolio weights (%):')
-        for t, w in result.weights.sort_values(ascending=False).items():
-            print(f'    {t:<12} {w:5.1f}%')
+    if not weights.empty:
+        print("\n  Portfolio weights (%):")
+        for t, w in weights.sort_values(ascending=False).items():
+            print(f"    {t:<14} {w:5.1f}%")
 
-    off_diag.sort(key=lambda x: x[0], reverse=True)
-    print('\n  Highest correlation pairs:')
-    for r, p, a, b in off_diag[:5]:
-        sig = ' (significant)' if p < 0.05 else ''
-        print(f'    {a} ↔ {b}:  r = {r:+.3f}{sig}')
+    print("\n  Highest correlation pairs (most similar):")
+    for r, p, a, b in off[:5]:
+        sig = " *" if p < 0.05 else ""
+        print(f"    {a} ↔ {b}:  r = {r:+.3f}{sig}")
 
-    off_diag.sort(key=lambda x: x[0])
-    print('\n  Lowest correlation pairs (diversification):')
-    for r, p, a, b in off_diag[:5]:
-        print(f'    {a} ↔ {b}:  r = {r:+.3f}')
+    print("\n  Best diversifiers (lowest correlation):")
+    for r, p, a, b in off[-5:]:
+        print(f"    {a} ↔ {b}:  r = {r:+.3f}")
 
-    print('═' * 72 + '\n')
+    print("═" * 72)
 
 
-def export_csv(
-    result: CorrelationResult,
-    out_dir: str = '.',
-) -> Tuple[str, str]:
-    """Write correlation matrix and pairwise list to CSV."""
-    import os
+# ── CSV export ──────────────────────────────────────────────────────────────────
 
-    matrix_path = os.path.join(out_dir, 'correlation_matrix.csv')
-    pairs_path = os.path.join(out_dir, 'correlation_pairs.csv')
+def export_csv(corr: pd.DataFrame, pval: pd.DataFrame, weights: pd.Series) -> None:
+    RESULTS.mkdir(exist_ok=True)
+    corr.to_csv(OUT_CSV, float_format="%.4f")
+    print(f"✓ Matrix CSV → {OUT_CSV}")
 
-    result.corr.to_csv(matrix_path, float_format='%.4f')
-
+    tickers = list(corr.columns)
     rows = []
-    tickers = list(result.corr.columns)
     for i, a in enumerate(tickers):
         for j, b in enumerate(tickers):
             if j >= i:
                 continue
             rows.append({
-                'asset_a': a,
-                'asset_b': b,
-                'correlation': result.corr.loc[a, b],
-                'p_value': result.pvalues.loc[a, b],
-                'weight_a_pct': result.weights.get(a, 0),
-                'weight_b_pct': result.weights.get(b, 0),
+                "asset_a":      a,
+                "asset_b":      b,
+                "correlation":  corr.loc[a, b],
+                "p_value":      pval.loc[a, b],
+                "weight_a_pct": weights.get(a, 0.0),
+                "weight_b_pct": weights.get(b, 0.0),
             })
-    pairs = pd.DataFrame(rows).sort_values('correlation', ascending=False)
-    pairs.to_csv(pairs_path, index=False, float_format='%.6f')
-
-    return matrix_path, pairs_path
-
-
-def _dark_theme() -> None:
-    plt.rcParams.update({
-        'figure.facecolor': _DARK_BG,
-        'axes.facecolor': _PANEL_BG,
-        'axes.edgecolor': _GRID,
-        'axes.labelcolor': _DIM,
-        'text.color': _TEXT,
-        'xtick.color': _DIM,
-        'ytick.color': _DIM,
-        'grid.color': _GRID,
-        'font.family': 'sans-serif',
-    })
+    (
+        pd.DataFrame(rows)
+        .sort_values("correlation", ascending=False)
+        .to_csv(OUT_PAIRS, index=False, float_format="%.6f")
+    )
+    print(f"✓ Pairs CSV  → {OUT_PAIRS}")
 
 
-def plot_heatmap(
-    result: CorrelationResult,
-    out_path: str = 'correlation_matrix.png',
-) -> None:
-    """Lower-triangle correlation heatmap with significance stars."""
-    corr, pval = result.corr, result.pvalues
+# ── Heatmap ─────────────────────────────────────────────────────────────────────
+
+def plot_heatmap(corr: pd.DataFrame, pval: pd.DataFrame, days: int, method: str) -> None:
     n = len(corr)
-
     _dark_theme()
-    sz = max(10, n * 0.9 + 2)
+    sz  = max(10, n * 0.9 + 2)
     fig, ax = plt.subplots(figsize=(sz, sz * 0.88), facecolor=_DARK_BG)
     ax.set_facecolor(_PANEL_BG)
 
     cmap = LinearSegmentedColormap.from_list(
-        'fin_corr',
-        ['#C0392B', '#922B21', _PANEL_BG, '#1A5276', '#2980B9'],
+        "fin_corr",
+        ["#C0392B", "#922B21", _PANEL_BG, "#1A5276", "#2980B9"],
         N=256,
     )
+    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
 
-    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1, aspect='auto')
     tickers = list(corr.columns)
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    ax.set_xticklabels(tickers, rotation=45, ha='right', fontsize=9, color=_TEXT)
+    ax.set_xticklabels(tickers, rotation=45, ha="right", fontsize=9, color=_TEXT)
     ax.set_yticklabels(tickers, fontsize=9, color=_TEXT)
 
     for i in range(n):
         for j in range(n):
             if j > i:
-                ax.add_patch(plt.Rectangle(
-                    (j - 0.5, i - 0.5), 1, 1, color=_DARK_BG, zorder=2,
-                ))
+                ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, color=_DARK_BG, zorder=2))
                 continue
-            val = corr.iloc[i, j]
-            p = pval.iloc[i, j]
-            star = (
-                '***' if p < 0.001 else
-                '**' if p < 0.01 else
-                '*' if p < 0.05 else ''
-            )
+            val, p = corr.iloc[i, j], pval.iloc[i, j]
+            star = "***" if p < 0.001 else "**" if p < 0.01 else "*" if p < 0.05 else ""
             if i == j:
-                ax.text(
-                    j, i, tickers[i], ha='center', va='center',
-                    fontsize=8, fontweight='bold', color=_ACCENT1,
-                )
+                ax.text(j, i, tickers[i], ha="center", va="center",
+                        fontsize=8, fontweight="bold", color=_ACCENT1)
             else:
-                tc = _TEXT if abs(val) < 0.6 else 'white'
-                ax.text(
-                    j, i, f'{val:.2f}\n{star}',
-                    ha='center', va='center', fontsize=8, color=tc,
-                    fontweight='bold' if abs(val) > 0.5 else 'normal',
-                )
+                tc = _TEXT if abs(val) < 0.6 else "white"
+                ax.text(j, i, f"{val:.2f}\n{star}", ha="center", va="center",
+                        fontsize=8, color=tc,
+                        fontweight="bold" if abs(val) > 0.5 else "normal")
 
     for k in range(n + 1):
         ax.axhline(k - 0.5, color=_DARK_BG, linewidth=0.7)
@@ -384,88 +369,82 @@ def plot_heatmap(
     cbar.ax.yaxis.set_tick_params(color=_DIM)
     cbar.outline.set_edgecolor(_GRID)
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color=_DIM, fontsize=8)
-    cbar_label = 'Spearman ρ' if result.corr_method == 'spearman' else 'Pearson r'
-    cbar.set_label(cbar_label, color=_DIM, fontsize=9)
+    cbar.set_label("Spearman ρ" if method == "spearman" else "Pearson r",
+                   color=_DIM, fontsize=9)
 
-    ret_label = 'log-return' if result.return_method == 'log' else 'simple return'
     ax.set_title(
-        f'ASSET CORRELATION MATRIX   ·   {result.days}d {ret_label}  ·  '
-        f'{n} assets',
-        color=_TEXT, fontsize=13, fontweight='bold', pad=16,
+        f"ASSET CORRELATION MATRIX   ·   {days}d   ·   {n} assets   ·   {method}",
+        color=_TEXT, fontsize=13, fontweight="bold", pad=16,
     )
-    fig.text(0.01, 0.01, '* p<0.05  ** p<0.01  *** p<0.001', color=_DIM, fontsize=8)
-    fig.text(
-        0.99, 0.01, 'T-Invest Portfolio Analytics',
-        ha='right', color=_DIM, fontsize=8, style='italic',
-    )
+    fig.text(0.01, 0.01, "* p<0.05  ** p<0.01  *** p<0.001", color=_DIM, fontsize=8)
+    fig.text(0.99, 0.01, "T-Invest · Portfolio Analytics",
+             ha="right", color=_DIM, fontsize=8, style="italic")
 
     plt.tight_layout()
-    fig.savefig(out_path, dpi=180, bbox_inches='tight', facecolor=_DARK_BG)
+    RESULTS.mkdir(exist_ok=True)
+    fig.savefig(OUT_PNG, dpi=180, bbox_inches="tight", facecolor=_DARK_BG)
     plt.close(fig)
+    print(f"✓ Heatmap    → {OUT_PNG}")
 
 
-def run_correlation_analysis(
-    positions: List[Dict],
-    *,
-    token: str,
-    days: int = 180,
-    min_weight_pct: float = 0.0,
-    top_n: Optional[int] = None,
-    corr_method: CorrMethod = 'pearson',
-    return_method: ReturnMethod = 'log',
-    plot: bool = True,
-    export: bool = True,
-    print_report: bool = True,
-    out_dir: str = '.',
-    heatmap_path: str = 'correlation_matrix.png',
-) -> Optional[CorrelationResult]:
-    """
-    End-to-end correlation analysis for portfolio positions.
+# ── CLI ─────────────────────────────────────────────────────────────────────────
 
-    Returns CorrelationResult or None if insufficient data.
-    """
-    figi_map = build_figi_map(
-        positions,
-        min_weight_pct=min_weight_pct,
-        top_n=top_n,
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Portfolio correlation matrix via T-Invest API"
     )
-    if len(figi_map) < 2:
-        print('⚠  Not enough instruments for correlation analysis.')
-        return None
+    parser.add_argument(
+        "days", nargs="?", type=int, default=730,
+        help="Lookback window in calendar days (default: 730 = 2 years)",
+    )
+    parser.add_argument("--top",      type=int, default=None, help="Use only top-N assets by portfolio value")
+    parser.add_argument("--spearman", action="store_true",    help="Use Spearman instead of Pearson correlation")
+    args = parser.parse_args()
 
-    print(f'Loading {days}-day history for {len(figi_map)} assets…')
-    history = asyncio.run(fetch_price_history(figi_map, days, token))
+    method = "spearman" if args.spearman else "pearson"
+
+    df, figi_map = load_snapshot(top_n=args.top)
+    if len(figi_map) < 2:
+        print("⚠  Need at least 2 shares/ETFs in portfolio.")
+        return
+
+    figi_map[CURRENCY_FIGI["usd"]] = "USDRUB"
+
+    print(f"Found {len(figi_map)} assets: {', '.join(figi_map.values())}")
+    print(f"Fetching {args.days}-day price history from T-Invest…")
+
+    history = fetch_price_history(figi_map, days=args.days)
     if len(history) < 2:
-        print('⚠  Could not load enough price history.')
-        return None
+        print("⚠  Not enough price history loaded.")
+        return
+
+    print("Fetching Brent, Nutrien from Yahoo Finance…")
+    history.update(fetch_external_prices(args.days))
+
+    print("Fetching IMOEX, RTSI from MOEX ISS…")
+    history.update(fetch_moex_indices(args.days))
+
+    # Strip timezone from all series — T-Invest returns tz-aware UTC, yfinance varies
+    history = {
+        t: pd.Series(s.values, index=(
+            s.index.tz_convert("UTC").tz_localize(None) if s.index.tz is not None else s.index
+        ).normalize())
+        for t, s in history.items()
+    }
 
     try:
-        returns = build_returns_matrix(history, method=return_method)
+        returns = build_returns_matrix(history)
     except ValueError as e:
-        print(f'⚠  {e}')
-        return None
+        print(f"⚠  {e}")
+        return
 
-    corr, pval = compute_correlation(returns, method=corr_method)
-    weights = portfolio_weights(positions, list(corr.columns))
-    result = CorrelationResult(
-        corr=corr,
-        pvalues=pval,
-        returns=returns,
-        weights=weights,
-        days=days,
-        tickers=list(corr.columns),
-        corr_method=corr_method,
-        return_method=return_method,
-    )
+    corr, pval = compute_correlation(returns, method=method)
+    weights    = portfolio_weights_from_csv(df, list(corr.columns))
 
-    if print_report:
-        print_summary(result)
-    if export:
-        matrix_csv, pairs_csv = export_csv(result, out_dir)
-        print(f'✓ Correlation matrix CSV → {matrix_csv}')
-        print(f'✓ Pairwise correlations  → {pairs_csv}')
-    if plot:
-        plot_heatmap(result, heatmap_path)
-        print(f'✓ Correlation heatmap    → {heatmap_path}')
+    print_report(corr, pval, weights, args.days, method)
+    export_csv(corr, pval, weights)
+    plot_heatmap(corr, pval, args.days, method)
 
-    return result
+
+if __name__ == "__main__":
+    main()

@@ -51,7 +51,7 @@ RESULTS  = _ROOT / "Results"
 OUT_PATH = RESULTS / "markowitz.png"
 
 # OFZ 10-year yield used as risk-free rate
-RISK_FREE_RATE = 0.16
+RISK_FREE_RATE = 0.12
 
 # ── Dark theme ─────────────────────────────────────────────────────────────────
 
@@ -95,6 +95,7 @@ def load_snapshot(top_n: Optional[int] = None) -> Tuple[pd.DataFrame, Dict[str, 
     df = pd.read_csv(SNAPSHOT)
     df["rub_value"]  = pd.to_numeric(df["rub_value"],  errors="coerce").fillna(0)
     df["weight_pct"] = pd.to_numeric(df["weight_pct"], errors="coerce").fillna(0)
+    df = df[~df["figi"].str.startswith("FUT", na=False)]
 
     figi_map = build_figi_map_from_csv(df, top_n=top_n)
     name_map = (
@@ -159,7 +160,7 @@ def optimize_portfolio(returns: pd.DataFrame) -> Dict:
     cov         = returns.cov()  * 252
     n           = len(mean_ret)
     tickers     = list(mean_ret.index)
-    bounds      = [(0.0, 1.0)] * n
+    bounds      = [(0.0, 0.25)] * n
     constraints = {"type": "eq", "fun": lambda w: w.sum() - 1}
     init        = np.ones(n) / n
 
@@ -446,7 +447,7 @@ def plot_markowitz(
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> Tuple[int, Optional[int], str]:
-    days   = 365
+    days   = 580
     top_n  = None
     method = "pearson"
     i = 1
