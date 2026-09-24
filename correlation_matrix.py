@@ -3,7 +3,7 @@ correlation_matrix.py
 ---------------------
 Reads data/portfolio.csv, fetches daily price history from T-Invest API for
 shares and ETFs, computes Pearson (or Spearman) correlation on log-returns,
-and saves a heatmap PNG plus CSV exports to Results/.
+saves a heatmap PNG to data/images/, and CSV exports to Results/.
 
 Usage:
     export INVEST_TOKEN='your_token'
@@ -43,8 +43,9 @@ from portfolio_works_library import (
 )
 
 SNAPSHOT  = _ROOT / "data" / "portfolio.csv"
+IMAGES    = _ROOT / "data" / "images"
 RESULTS   = _ROOT / "Results"
-OUT_PNG   = RESULTS / "correlation_matrix.png"
+OUT_PNG   = IMAGES / "correlation_matrix.png"
 OUT_CSV   = RESULTS / "correlation_matrix.csv"
 OUT_PAIRS = RESULTS / "correlation_pairs.csv"
 
@@ -381,7 +382,7 @@ def plot_heatmap(corr: pd.DataFrame, pval: pd.DataFrame, days: int, method: str)
              ha="right", color=_DIM, fontsize=8, style="italic")
 
     plt.tight_layout()
-    RESULTS.mkdir(exist_ok=True)
+    IMAGES.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT_PNG, dpi=180, bbox_inches="tight", facecolor=_DARK_BG)
     plt.close(fig)
     print(f"✓ Heatmap    → {OUT_PNG}")

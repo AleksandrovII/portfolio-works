@@ -1,5 +1,6 @@
 import csv
 import asyncio
+import pathlib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -12,6 +13,8 @@ from t_tech.invest.utils import now
 import functools
 from t_tech.invest import OperationState
 from time import sleep
+
+IMAGES = pathlib.Path(__file__).parent / "data" / "images"
 
 
 def get_currency_rate(client, figi):
@@ -281,7 +284,8 @@ def plot_assets(positions, total_value):
                     f'{width:,.0f}', ha='left', va='center', fontsize=8)
     
     plt.tight_layout()
-    plt.savefig("assets.png", dpi=150, bbox_inches='tight')
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    plt.savefig(IMAGES / "assets.png", dpi=150, bbox_inches='tight')
     plt.show()
 
 async def get_history(client, figi, days=180):
@@ -338,7 +342,8 @@ def markowitz_analysis(positions):
     sns.heatmap(corr, mask=mask, annot=True, fmt='.2f', cmap='coolwarm', center=0)
     plt.title('Корреляция активов')
     plt.tight_layout()
-    plt.savefig("correlation.png", dpi=150)
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    plt.savefig(IMAGES / "correlation.png", dpi=150)
     plt.show()
     
     # Оптимизация Марковица
@@ -368,7 +373,8 @@ def markowitz_analysis(positions):
     plt.ylabel('Вес (%)')
     plt.title(f'Оптимальные веса\nДоходность: {opt_return*100:.1f}%, Волатильность: {opt_vol*100:.1f}%')
     plt.tight_layout()
-    plt.savefig("optimization.png", dpi=150)
+    IMAGES.mkdir(parents=True, exist_ok=True)
+    plt.savefig(IMAGES / "optimization.png", dpi=150)
     plt.show()
 
 def main():

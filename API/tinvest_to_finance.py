@@ -27,6 +27,7 @@ Usage:
 """
 
 import os
+import pathlib
 import sys
 import logging
 from decimal import Decimal
@@ -51,6 +52,8 @@ from t_tech.invest import Client
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
                     level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+IMAGES = pathlib.Path(__file__).parent.parent / "data" / "images"
 
 TOKEN = os.getenv("INVEST_TOKEN")
 if not TOKEN:
@@ -459,13 +462,17 @@ def _dark_theme():
 
 
 def plot_assets(positions: List[Dict],
-                out_path: str = 'assets_distribution.png') -> None:
+                out_path: str = None) -> None:
     """
     Three-panel dark financial dashboard:
       Panel A (top-left)  — Donut: asset-class allocation
       Panel B (top-right) — Horizontal bars: top-15 positions
       Panel C (bottom)    — Stacked bars: per-account breakdown
     """
+    if out_path is None:
+        IMAGES.mkdir(parents=True, exist_ok=True)
+        out_path = IMAGES / "assets_distribution.png"
+
     _dark_theme()
 
     # Aggregate by asset class (all positions including cash)

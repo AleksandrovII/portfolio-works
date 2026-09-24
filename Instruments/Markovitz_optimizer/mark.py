@@ -47,8 +47,8 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 SNAPSHOT = _ROOT / "data" / "portfolio.csv"
-RESULTS  = _ROOT / "Results"
-OUT_PATH = RESULTS / "markowitz.png"
+IMAGES   = _ROOT / "data" / "images"
+OUT_PATH = IMAGES / "markowitz.png"
 
 # OFZ 10-year yield used as risk-free rate
 RISK_FREE_RATE = 0.12
@@ -438,7 +438,7 @@ def plot_markowitz(
              ha="right", fontsize=8, color=_DIM, style="italic")
 
     plt.tight_layout()
-    RESULTS.mkdir(exist_ok=True)
+    IMAGES.mkdir(parents=True, exist_ok=True)
     fig.savefig(OUT_PATH, dpi=180, bbox_inches="tight", facecolor=_DARK_BG)
     plt.close(fig)
     print(f"✓ Chart saved → {OUT_PATH}")

@@ -15,6 +15,19 @@ from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+# T-Bank/T-Invest serves a TLS cert issued by Russia's government CA
+# ("Russian Trusted Sub CA"), which isn't in grpc's/certifi's default trust
+# store. Point grpc (and requests, for good measure) at our combined bundle
+# *before* importing t_tech, or every API call fails with:
+#   SSL_ERROR_SSL: CERTIFICATE_VERIFY_FAILED: self signed certificate in
+#   certificate chain
+# Regenerate the bundle with certs/build_ca_bundle.sh if it's missing.
+_CA_BUNDLE = os.path.join(os.path.dirname(__file__), "certs", "combined_ca_bundle.pem")
+if os.path.exists(_CA_BUNDLE):
+    os.environ.setdefault("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", _CA_BUNDLE)
+    os.environ.setdefault("SSL_CERT_FILE", _CA_BUNDLE)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", _CA_BUNDLE)
+
 import numpy as np
 import pandas as pd
 from t_tech.invest import AsyncClient, Client, CandleInterval
@@ -24,6 +37,7 @@ try:
     from finam_trade_api import TokenManager
     from finam_trade_api.access import TokenClient
     from finam_trade_api.account import AccountClient
+    from finam_trade_api.assets import AssetsClient
     _FINAM_SDK = True
 except ImportError:
     _FINAM_SDK = False
@@ -112,6 +126,54 @@ def get_instrument_info(client: Client, figi: str) -> Optional[Dict]:
 
 # ── Portfolio positions ────────────────────────────────────────────────────────
 
+def fetch_cash_positions(
+    client: Client,
+    account,
+) -> List[Dict]:
+    """
+    Return the account's RUB cash balance via GetPositions().money.
+
+    GetPortfolio's `positions` list never includes a RUB cash line — it's
+    the reporting currency, not a tradable instrument — so it's otherwise
+    invisible. With margin trading enabled this balance can go negative
+    (broker-lent rubles used to cover a leveraged buy), which needs to
+    show up as a negative rub_value instead of being silently dropped.
+
+    Non-RUB balances (CNY, XAU, ...) are skipped here: T-Invest already
+    represents them as ordinary tradable positions (e.g. CNYRUB_TOM,
+    GLDRUB_TOM) in portfolio.positions, correctly valued at market price —
+    re-adding them from .money would double-count them, and at the wrong
+    price since `rates` only covers a handful of FX pairs.
+    """
+    rows: List[Dict] = []
+    try:
+        resp = client.operations.get_positions(account_id=account.id)
+    except Exception as e:
+        logger.warning("Cannot fetch cash positions for %s: %s", account.name, e)
+        return rows
+
+    for money in resp.money:
+        currency = money.currency.lower()
+        if currency != "rub":
+            continue
+        balance = _q(money)
+        if balance == 0:
+            continue
+        rows.append({
+            "account":         account.name,
+            "figi":            "",
+            "name":            f"Деньги ({currency.upper()})",
+            "ticker":          currency.upper(),
+            "currency":        currency,
+            "instrument_type": "currency",
+            "quantity":        balance,
+            "avg_price":       Decimal("1"),
+            "cur_price":       Decimal("1"),
+            "rub_value":       balance,
+        })
+    return rows
+
+
 def fetch_all_positions(
     client: Client,
     rates: Dict[str, Decimal],
@@ -122,6 +184,10 @@ def fetch_all_positions(
     Each dict contains:
         account, figi, name, ticker, currency, instrument_type,
         quantity, avg_price, cur_price, rub_value
+
+    Includes:
+        - cash balances per currency (see fetch_cash_positions), which can
+          be negative when margin trading leaves an account short cash
 
     Skips:
         - derivative/unknown instruments (get_instrument_info returns None)
@@ -140,6 +206,8 @@ def fetch_all_positions(
         except Exception as e:
             logger.warning("Skipping account %s: %s", account.name, e)
             continue
+
+        rows.extend(fetch_cash_positions(client, account))
 
         for pos in portfolio.positions:
             info = get_instrument_info(client, pos.figi)
@@ -385,6 +453,17 @@ def portfolio_weights_from_csv(
 
 _FINAM_SKIP_TYPES = {"FORTS"}
 
+# AssetsClient.get_asset()'s `type` field, mapped onto this project's
+# instrument_type taxonomy (see TRADABLE_TYPES). Closed-end funds (ПИФы,
+# e.g. "Парус") come back as FUNDS, not EQUITIES — matches how T-Invest
+# already classifies the same kind of instrument as "etf".
+_FINAM_ASSET_TYPE_MAP: Dict[str, str] = {
+    "EQUITIES":   "share",
+    "BONDS":      "bond",
+    "FUNDS":      "etf",
+    "CURRENCIES": "currency",
+}
+
 
 def _dec(val: Any) -> Decimal:
     """Convert FinamDecimal / dict / str / number to Decimal."""
@@ -397,17 +476,39 @@ def _dec(val: Any) -> Decimal:
     return Decimal(str(val))
 
 
+async def _finam_get_account_ids(jwt_token: str) -> List[str]:
+    """
+    Fetch the account IDs tied to a Finam JWT session token.
+
+    Equivalent to TokenClient.get_jwt_token_details(), reimplemented
+    because that method attaches an `Authorization` header to the
+    /sessions/details call — and Finam's API rejects that combination
+    with "Token is invalid or malformed", even for a token that is
+    perfectly valid. The endpoint only wants the token in the body.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(http2=True) as client:
+        resp = await client.post(
+            "https://api.finam.ru/v1/sessions/details",
+            json={"token": jwt_token},
+        )
+        resp.raise_for_status()
+        return resp.json()["account_ids"]
+
+
 async def _finam_fetch_async() -> List[Dict]:
     tm = TokenManager(token=FINAM_TOKEN)
     tc = TokenClient(token_manager=tm)
     await tc.set_jwt_token()
-    details = await tc.get_jwt_token_details()
-    logger.info("Finam: %d accounts found", len(details.account_ids))
+    account_ids = await _finam_get_account_ids(tm.jwt_token)
+    logger.info("Finam: %d accounts found", len(account_ids))
 
-    ac = AccountClient(token_manager=tm)
+    ac  = AccountClient(token_manager=tm)
+    asc = AssetsClient(token_manager=tm)
     rows: List[Dict] = []
 
-    for acc_id in details.account_ids:
+    for acc_id in account_ids:
         resp, ok = await ac._exec_request("GET", f"/accounts/{acc_id}")
         if not ok:
             logger.warning("Finam: account %s error: %s", acc_id, resp)
@@ -426,13 +527,27 @@ async def _finam_fetch_async() -> List[Dict]:
             cur_price = _dec(pos.get("current_price"))
             if qty == 0:
                 continue
+
+            # /accounts/{id} only returns the raw symbol (e.g.
+            # "RU000A10CFM8@MISX") — no name or asset class. Look those up
+            # via AssetsClient so a closed-end real-estate fund like "Парус"
+            # doesn't get mislabeled as a plain share.
+            ticker, name, instrument_type = symbol, symbol, "share"
+            try:
+                asset = await asc.get_asset(symbol, acc_id)
+                ticker           = asset.ticker or symbol
+                name             = asset.name or symbol
+                instrument_type  = _FINAM_ASSET_TYPE_MAP.get(asset.type, "share")
+            except Exception as e:
+                logger.warning("Finam: could not resolve asset %s: %s", symbol, e)
+
             rows.append({
                 "account":         account_name,
                 "figi":            "",
-                "name":            symbol,
-                "ticker":          symbol,
+                "name":            name,
+                "ticker":          ticker,
                 "currency":        "rub",
-                "instrument_type": "share",
+                "instrument_type": instrument_type,
                 "quantity":        qty,
                 "avg_price":       avg_price,
                 "cur_price":       cur_price,

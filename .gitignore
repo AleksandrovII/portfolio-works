@@ -1,6 +1,9 @@
-# Generated data files — contain private financial data
-data/portfolio.csv
-data/deals.csv
+# Generated data files — contain private financial data (snapshots, charts)
+data/
+
+# SIBN dividend model — API cache and generated reports
+sibn_dividends/data/cache/
+sibn_dividends/output/
 
 # Python
 __pycache__/
@@ -13,3 +16,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Downloaded CA certs (regeneratable, machine-specific paths not needed in repo)
+certs/
